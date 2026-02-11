@@ -34,7 +34,6 @@ from collections import deque
 from contextlib import asynccontextmanager, AsyncExitStack
 import contextvars
 from dataclasses import dataclass
-import re
 from typing import Any, AsyncGenerator, Dict, List, Optional, Union
 from uuid import uuid4
 
@@ -57,6 +56,7 @@ from mcpgateway.config import settings
 from mcpgateway.db import SessionLocal
 from mcpgateway.services.completion_service import CompletionService
 from mcpgateway.services.logging_service import LoggingService
+from mcpgateway.transports.rust_streamable_bridge import RustStreamableHTTPTransportBridge
 from mcpgateway.services.prompt_service import PromptService
 from mcpgateway.services.resource_service import ResourceService
 from mcpgateway.services.tool_service import ToolService
@@ -827,6 +827,7 @@ class SessionManagerWrapper:
             stateless=stateless,
         )
         self.stack = AsyncExitStack()
+        self.rust_bridge = RustStreamableHTTPTransportBridge.from_env()
 
     async def initialize(self) -> None:
         """
@@ -887,19 +888,15 @@ class SessionManagerWrapper:
             ['scope', 'receive', 'send']
         """
 
-        path = scope["modified_path"]
-        match = re.search(r"/servers/(?P<server_id>[a-fA-F0-9\-]+)/mcp", path)
-
-        # Extract request headers from scope
         headers = dict(Headers(scope=scope))
-        # Store headers in context for tool invocations
-        request_headers_var.set(headers)
+        # Make headers available to Rust/Python context normalizer.
+        scope["headers_dict"] = headers
 
-        if match:
-            server_id = match.group("server_id")
-            server_id_var.set(server_id)
-        else:
-            server_id_var.set(None)
+        context = await self.rust_bridge.prepare_request_context(scope)
+
+        # Store headers in context for tool invocations
+        request_headers_var.set(context.headers or headers)
+        server_id_var.set(context.server_id)
 
         try:
             await self.session_manager.handle_request(scope, receive, send)
